@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# svc accounts
+svc_account*
+*svc_account*
