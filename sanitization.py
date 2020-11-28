@@ -1,14 +1,17 @@
 import os
 from google.cloud import bigquery
 import json
+from dotenv import load_dotenv
+from datetime import date
 
+load_dotenv()
 EVENTS_TABLE_DEV = os.environ["EVENTS_TABLE_DEV"]
 EVENTS_TABLE_PROD = os.environ["EVENTS_TABLE_PROD"]
 FIRESTORE_TABLE_CHANGELOG = os.environ["FIRESTORE_TABLE_CHANGELOG"]
 FIRESTORE_LATEST = os.environ["FIRESTORE_LATEST"]
 SVC_ACCOUNT_FIRESTORE = os.environ["SVC_ACCOUNT_FIRESTORE"]
 SVC_ACCOUNT_EVENTS = os.environ["SVC_ACCOUNT_EVENTS"]
-JSON_FILE_PATH = os.environ["JSON_FILE_PATH"]
+CHANNEL = os.environ["CHANNEL"]
 DEST_PROJECT_ID = os.environ["DEST_PROJECT_ID"]
 DEST_DATASET_ID = os.environ["DEST_DATASET_ID"]
 DEST_TABLE_ID = os.environ["DEST_TABLE_ID"]
@@ -28,14 +31,27 @@ DEST_TABLE_SCHEMA = {'name': 'email', 'type': 'STRING', 'mode': 'NULLABLE'}, \
 
 class BigQueryProcessor:
     def __init__(self, svc_account, project_id, dataset_id, dest_table, dest_table_schema,
-                 orgs_dataset):
+                 orgs_dataset, channel):
         self.project_id = project_id
         self.dataset_id = dataset_id
         self.dest_table = dest_table
-        self.user_orgs = self.get_user_historical_orgs(orgs_dataset)
+        self.channel = channel
         self.svc_account = self.set_svc_account(svc_account)
         self.client = bigquery.Client()
+        self.user_orgs = self.get_user_historical_orgs(orgs_dataset)
         self.dest_table_schema = self.format_schema(dest_table_schema)
+        self.dest_json_file = f'./Sanitized_Data_{channel}_{date.today()}.json'
+        self.channel_hashmap = {
+         "Digital Dashboard Blast": "otsuka",
+         "CNS Dashboard Blast": "otsuka",
+         "Neph Dashboard Blast": "otsuka",
+         "neph_map_viewer": "otsuka",
+         "Marketplace Blast": "marketplace",
+         "marketplace_profiles_viewer": "marketplace",
+         "marketplace_post_viewer": "marketplace",
+         "marketplace_map_viewer": "marketplace",
+         "celltelligence": "celltelligence"
+          }
 
     def run_query(self, query):
         """
@@ -51,10 +67,9 @@ class BigQueryProcessor:
         except Exception as e:
             print(f"Error processing query: {query}. Error was: {e}")
 
-    def load_data_from_file(self, json_file):
+    def load_data_from_file(self):
         """
         Loads json newline delimited file to BigQuery table
-        :param json_file: json file path
         :return: None
         """
         try:
@@ -65,7 +80,7 @@ class BigQueryProcessor:
             job_config.source_format = bigquery.SourceFormat.NEWLINE_DELIMITED_JSON
             job_config.schema = self.dest_table_schema
             job_config.autodetect = True
-            with open(json_file, "rb") as source_file:
+            with open(self.dest_json_file, "rb") as source_file:
                 job = self.client.load_table_from_file(source_file, table, job_config=job_config)
             print(job.result())
             print("Loaded {} rows into {}:{}.".format(job.output_rows, dataset, table))
@@ -92,21 +107,19 @@ class BigQueryProcessor:
         records = [dict(row) for row in query_job]
         print(*records, sep='\n')
 
-    @staticmethod
-    def create_json_newline_delimited_file(file_path, json_object):
+    def create_json_newline_delimited_file(self, json_object):
         """
         Create a json delimited file from a json object, required format
         to load data from file to BigQuery table
-        :param file_path: json file path
         :param json_object: list/tuple iterable json object
         :return: None
         """
         print("Generating JSON file...")
-        with open(file_path, 'w') as f:
+        with open(self.dest_json_file, 'w') as f:
             for d in json_object:
                 json.dump(d, f, default=str)
                 f.write('\n')
-        print(f"JSON file created at path: {file_path}")
+        print(f"JSON file created at path: {self.dest_json_file}")
 
     def get_user_historical_orgs(self, table):
         """
@@ -116,20 +129,25 @@ class BigQueryProcessor:
         """
         query_firebase_user_orgs = f"""
         SELECT
-               MIN(timestamp) org_change,
+               timestamp as org_change,
                LOWER(JSON_EXTRACT_SCALAR(data , "$.user_email")) user,
-               JSON_EXTRACT_SCALAR(data , "$.user_subscription_notification[0]") AS org,
+               TRIM(ARRAY_REVERSE(JSON_EXTRACT_ARRAY(data , "$.user_subscription_notification"))[OFFSET(0)], "\\"") as org,
         FROM {table}
         WHERE 
                JSON_EXTRACT_SCALAR(data , "$.user_email") NOT LIKE '%fenix%' AND
-               JSON_EXTRACT_SCALAR(data , "$.user_subscription_notification[0]") IS NOT NULL 
-        GROUP BY 2,3
-        ORDER BY org_change
+               TRIM(ARRAY_REVERSE(JSON_EXTRACT_ARRAY(data , "$.user_subscription_notification"))[OFFSET(0)], "\\"") IS NOT NULL 
+        GROUP BY 1,2,3
+        ORDER BY user
         """
         query_job_firestore = self.run_query(query_firebase_user_orgs)
         users_hash_map = {row['user']: {} for row in query_job_firestore}
         for row in query_job_firestore:
-            users_hash_map[row['user']].update({row['org']: str(row['org_change'])})
+            if row['org'] not in users_hash_map[row['user']]:
+                users_hash_map[row['user']].update({row['org']: str(row['org_change'])})
+            elif str(row['org_change']) < users_hash_map[row['user']][row['org']]:
+                users_hash_map[row['user']].update({row['org']: str(row['org_change'])})
+            else:
+                pass
         return users_hash_map
 
     def get_fixed_org(self, event_date, user):
@@ -143,7 +161,7 @@ class BigQueryProcessor:
             return None, None
         ordered_orgs = sorted(self.user_orgs[user].items(), key=lambda x: x[1], reverse=True)
         for org, org_change in ordered_orgs:
-            if str(event_date) > org_change:
+            if str(event_date) > org_change and org.split('-')[0].lower() == self.channel_hashmap[self.channel]:
                 return org, org_change
         return ordered_orgs[-1][0], ordered_orgs[-1][1]
 
@@ -178,13 +196,14 @@ if __name__ == "__main__":
       WHERE 
             email NOT LIKE '%fenix%' AND email NOT LIKE '%dbala%'
             AND event IN ('open', 'delivered', 'click', 'bounce')
-            AND channel IN ('celltelligence')
+            AND EXTRACT(DATE FROM post_date) BETWEEN PARSE_DATE('%Y%m%d', '20201123') AND PARSE_DATE('%Y%m%d', '20201128') 
+            AND channel IN ('{CHANNEL}')
     """
     processor_job = BigQueryProcessor(SVC_ACCOUNT_FIRESTORE, DEST_PROJECT_ID, DEST_DATASET_ID,
-                                      DEST_TABLE_ID, DEST_TABLE_SCHEMA, FIRESTORE_TABLE_CHANGELOG)
+                                      DEST_TABLE_ID, DEST_TABLE_SCHEMA, FIRESTORE_TABLE_CHANGELOG, CHANNEL)
     processor_job.set_svc_account(SVC_ACCOUNT_EVENTS)
     events_records = processor_job.run_query(QUERY_EVENTS)
     # processor_job.nice_query_stdout(query_job)
     fixed_event_records = processor_job.update_events_columns(events_records)
-    processor_job.create_json_newline_delimited_file(JSON_FILE_PATH, fixed_event_records)
-    processor_job.load_data_from_file(JSON_FILE_PATH)
+    processor_job.create_json_newline_delimited_file(fixed_event_records)
+    processor_job.load_data_from_file()
