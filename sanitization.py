@@ -7,7 +7,6 @@ from datetime import date
 load_dotenv()
 EVENTS_TABLE_DEV = os.environ["EVENTS_TABLE_DEV"]
 EVENTS_TABLE_PROD = os.environ["EVENTS_TABLE_PROD"]
-FIRESTORE_TABLE_CHANGELOG = os.environ["FIRESTORE_TABLE_CHANGELOG"]
 FIRESTORE_LATEST = os.environ["FIRESTORE_LATEST"]
 SVC_ACCOUNT_FIRESTORE = os.environ["SVC_ACCOUNT_FIRESTORE"]
 SVC_ACCOUNT_EVENTS = os.environ["SVC_ACCOUNT_EVENTS"]
@@ -30,15 +29,12 @@ DEST_TABLE_SCHEMA = {'name': 'email', 'type': 'STRING', 'mode': 'NULLABLE'}, \
 
 
 class BigQueryProcessor:
-    def __init__(self, svc_account, project_id, dataset_id, dest_table, dest_table_schema,
-                 orgs_dataset, channel):
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.dest_table = dest_table
+    def __init__(self, svc_account, project_id, dataset_id, dest_table, dest_table_schema, channel):
+        self.table_id = f'{project_id}.{dataset_id}.{dest_table}'
         self.channel = channel
         self.svc_account = self.set_svc_account(svc_account)
         self.client = bigquery.Client()
-        self.user_orgs = self.get_user_historical_orgs(orgs_dataset)
+        self.user_orgs = self.get_orgs()
         self.dest_table_schema = self.format_schema(dest_table_schema)
         self.dest_json_file = f'./Sanitized_Data_{channel}_{date.today()}.json'
         self.channel_hashmap = {
@@ -74,16 +70,13 @@ class BigQueryProcessor:
         """
         try:
             print("Loading data to BigQuery...")
-            dataset = self.client.dataset(DEST_DATASET_ID)
-            table = dataset.table(DEST_TABLE_ID)
-            job_config = bigquery.LoadJobConfig()
-            job_config.source_format = bigquery.SourceFormat.NEWLINE_DELIMITED_JSON
-            job_config.schema = self.dest_table_schema
-            job_config.autodetect = True
+            job_config = bigquery.LoadJobConfig(source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                                                schema=self.dest_table_schema)
+            # job_config.autodetect = True
             with open(self.dest_json_file, "rb") as source_file:
-                job = self.client.load_table_from_file(source_file, table, job_config=job_config)
+                job = self.client.load_table_from_file(source_file, self.table_id, job_config=job_config)
             print(job.result())
-            print("Loaded {} rows into {}:{}.".format(job.output_rows, dataset, table))
+            print("Loaded {} rows into {}.".format(job.output_rows, self.table_id))
         except Exception as e:
             print(f"Error loading data to BigQuery. Error was: {e}")
 
@@ -121,49 +114,26 @@ class BigQueryProcessor:
                 f.write('\n')
         print(f"JSON file created at path: {self.dest_json_file}")
 
-    def get_user_historical_orgs(self, table):
-        """
-        Get all distinct org changes per user on input table
-        :param table: BigQuery table name
-        :return: dict of dicts (users hash_map) object
-        """
+    def get_orgs(self):
         query_firebase_user_orgs = f"""
-        SELECT
-               timestamp as org_change,
-               LOWER(JSON_EXTRACT_SCALAR(data , "$.user_email")) user,
-               TRIM(ARRAY_REVERSE(JSON_EXTRACT_ARRAY(data , "$.user_subscription_notification"))[OFFSET(0)], "\\"") as org,
-        FROM {table}
-        WHERE 
-               JSON_EXTRACT_SCALAR(data , "$.user_email") NOT LIKE '%fenix%' AND
-               TRIM(ARRAY_REVERSE(JSON_EXTRACT_ARRAY(data , "$.user_subscription_notification"))[OFFSET(0)], "\\"") IS NOT NULL 
-        GROUP BY 1,2,3
-        ORDER BY user
+        SELECT * 
+        FROM fenix-marketplace-data.user_data.latest_orgs
+        ORDER BY email
         """
         query_job_firestore = self.run_query(query_firebase_user_orgs)
-        users_hash_map = {row['user']: {} for row in query_job_firestore}
+        users_hash_map = {row['email']: {} for row in query_job_firestore}
         for row in query_job_firestore:
-            if row['org'] not in users_hash_map[row['user']]:
-                users_hash_map[row['user']].update({row['org']: str(row['org_change'])})
-            elif str(row['org_change']) < users_hash_map[row['user']][row['org']]:
-                users_hash_map[row['user']].update({row['org']: str(row['org_change'])})
-            else:
-                pass
+            users_hash_map[row['email']].update({row['org']: str(row['org_changed'])})
         return users_hash_map
 
-    def get_fixed_org(self, event_date, user):
-        """
-        Get nearest org_change and its corresponding org
-        :param event_date: str event timestamp
-        :param user: user ID
-        :return: tuple: (org, org_change)
-        """
+    def get_channel_org(self, user):
         if user not in self.user_orgs:
             return None, None
-        ordered_orgs = sorted(self.user_orgs[user].items(), key=lambda x: x[1], reverse=True)
-        for org, org_change in ordered_orgs:
-            if str(event_date) > org_change and org.split('-')[0].lower() == self.channel_hashmap[self.channel]:
+        channel_org = self.channel_hashmap[self.channel]
+        for org, org_change in self.user_orgs[user].items():
+            if org.split('-')[0].lower() == channel_org:
                 return org, org_change
-        return ordered_orgs[-1][0], ordered_orgs[-1][1]
+        return None, None
 
     def update_events_columns(self, events):
         """
@@ -172,8 +142,7 @@ class BigQueryProcessor:
         """
         print("Updating events columns...")
         for index, row in enumerate(events):
-            events[index]['org'], events[index]['org_sync_date'] = self.get_fixed_org(row['post_date'],
-                                                                                      row['email'])
+            events[index]['org'], events[index]['org_sync_date'] = self.get_channel_org(row['email'].lower())
         return events
 
     @staticmethod
@@ -190,20 +159,22 @@ class BigQueryProcessor:
 
 
 if __name__ == "__main__":
+    start_date = '20200101'
+    end_date = '20201212'
     QUERY_EVENTS = f"""
     SELECT  *
             FROM {EVENTS_TABLE_PROD}
       WHERE 
             email NOT LIKE '%fenix%' AND email NOT LIKE '%dbala%'
             AND event IN ('open', 'delivered', 'click', 'bounce')
-            AND EXTRACT(DATE FROM post_date) BETWEEN PARSE_DATE('%Y%m%d', '20201123') AND PARSE_DATE('%Y%m%d', '20201128') 
+            AND EXTRACT(DATE FROM post_date) BETWEEN PARSE_DATE('%Y%m%d', {start_date}) AND PARSE_DATE('%Y%m%d', {end_date})
             AND channel IN ('{CHANNEL}')
+      ORDER BY post_date desc
     """
     processor_job = BigQueryProcessor(SVC_ACCOUNT_FIRESTORE, DEST_PROJECT_ID, DEST_DATASET_ID,
-                                      DEST_TABLE_ID, DEST_TABLE_SCHEMA, FIRESTORE_TABLE_CHANGELOG, CHANNEL)
+                                      DEST_TABLE_ID, DEST_TABLE_SCHEMA, CHANNEL)
     processor_job.set_svc_account(SVC_ACCOUNT_EVENTS)
     events_records = processor_job.run_query(QUERY_EVENTS)
-    # processor_job.nice_query_stdout(query_job)
     fixed_event_records = processor_job.update_events_columns(events_records)
     processor_job.create_json_newline_delimited_file(fixed_event_records)
     processor_job.load_data_from_file()
